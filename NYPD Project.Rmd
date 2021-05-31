@@ -1,0 +1,202 @@
+---
+title: "NYPD Shooting Incidents Historical Analysis"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Data Import and Cleaning
+
+I will begin by reading in our data courtesy of data.gov using tidyverse and looking at a summary. This is a dataframe of shooting incidents collected by the New York Police Department.
+
+```{r get_data}
+library(tidyverse)
+# Get data in the CSV file
+nypd_data <- 
+  read.csv("https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD")
+summary(nypd_data)
+```
+
+Here we can see several columns that will or might need data type changes. Occur date and occur time are characters but should be date/time type. I will look at the head of the dataframe later to see what format they are in.
+
+I am not interested today in doing analysis with location coordinates, or suspect/victim demographics, and will remove those columns.
+
+```{r remove_columns}
+# Demographic and coordinate columns are at the end, column 9 to end
+nypd_data <- nypd_data[,-c(9:19)]
+# Let's look at the new dataframe
+head(nypd_data)
+```
+
+We now have a table of incident times, location, and whether it was flagged as murder. It looks like much of our location description data is missing. I will now change our data formats to be more appropriate - adding a new column to combine the data and time, and changing the categorical data to factors.
+
+```{r coerce_data_types}
+# Add new DATE_TIME column as POSIXlt type
+nypd_data <- mutate(nypd_data, 
+                    DATE_TIME = as.POSIXlt(paste(OCCUR_DATE,OCCUR_TIME),format="%m/%d/%Y %H:%M:%OS"))
+# Coerce original date column to Date type
+nypd_data[,"OCCUR_DATE"] <- as.Date(nypd_data[,"OCCUR_DATE"],format="%m/%d/%Y")
+# Coerce categorical columns to factors
+cate <- c("BORO","PRECINCT","JURISDICTION_CODE","LOCATION_DESC","STATISTICAL_MURDER_FLAG")
+nypd_data[,cate] <- lapply(nypd_data[,cate],as.factor)
+# Let's look at the new dataframe
+summary(nypd_data)
+```
+
+We also have two NA values in jurisdiction code. Looking at the two rows, the data appears to be complete otherwise barring a couple of missing values. As I do not know how jurisdiction code is determined in this case, I cannot reconstruct the code values. If I do analysis by jurisdiction, I will go ahead and drop those two rows.
+
+```{r NA_jurisdiction}
+# Look at the two rows where jurisdiction code is NA
+filter(nypd_data, is.na(JURISDICTION_CODE))
+```
+
+## Analysis and Modeling
+
+### Analysis 1 - Call Volume by Borough
+
+I would like to investigate the number of incident per borough. I will also investigate if different boroughs have different rates of murder vs. non-murder incidents.
+
+I will start by looking at the overall incidents per year for the entirety of New York City, followed by that data broken down by borough.
+
+```{r calls_per_year}
+# Create column isolating the year
+nypd_data <- mutate(nypd_data,
+                OCCUR_YEAR=as.numeric(format(nypd_data[,"OCCUR_DATE"],"%Y")))
+# Group data by year
+groupyear <- nypd_data %>% count(OCCUR_YEAR)
+# Visualize
+plot(groupyear[,"OCCUR_YEAR"],groupyear[,"n"],type="l",xlab="Year",ylab="Total Calls",
+     ylim=c(0,max(groupyear[,"n"])),main="Calls per Year for NYC")
+```
+
+We can see that shooting incidents has been decreasing since 2006, bottoming out around 2018. In 2020, the incidents rapidly increase back to late 2000s levels. I'd like to look at this broken down per borough, to see if the decrease was even across all of NYC.
+
+```{r calls_by_boro}
+# Add column containing just the year
+nypd_data <- mutate(nypd_data, 
+                    OCCUR_YEAR = as.numeric(format(nypd_data[,"OCCUR_DATE"],"%Y")))
+# Group data by borough and year
+groupboroyear <- nypd_data %>% count(BORO, OCCUR_YEAR)
+# Visualize
+groupboroyear %>%
+  ggplot(aes(x=OCCUR_YEAR,y=n,fill=BORO,group=BORO)
+         )+geom_col(position=position_dodge())
+```
+
+All boroughs here show a decrease over the 2010s, but it looks like the overall decrease is mostly driven by Brooklyn's dip in incidents. It's worth noting that all five boroughs show a significant increase in 2020.
+
+To look at the proportion of murder calls per borough, I will group the data by both borough and the murder flag.
+
+```{r group_boro_and_murder}
+groupmurbor <- nypd_data %>% count(BORO, STATISTICAL_MURDER_FLAG)
+groupmurbor
+```
+
+This has collated all incidents per borough, split by whether it was flagged as a murder incident. I will now calculate the percentage per borough.
+
+```{r murder_flag_per_boro}
+# Set up vectors for later tabulation
+borolist <- vector(mode="character")
+totallist <- vector(mode="integer")
+murderlist <- vector(mode = "integer")
+proplist <- vector(mode="numeric")
+
+# For each borough, find the total number of calls,
+# the number of murder calls, and the proportion of
+# murder calls (murder / total)
+# Append these to our vectors
+for (i in unique(groupmurbor[,"BORO"])) {
+  temp <- subset(groupmurbor,BORO == i)
+  totalcalls <- sum(temp[,"n"])
+  murcalls <- temp[temp$STATISTICAL_MURDER_FLAG == "true","n"]
+  proportion <- murcalls / totalcalls * 100
+  borolist <- c(borolist, i)
+  totallist <- c(totallist, totalcalls)
+  murderlist <- c(murderlist, murcalls)
+  proplist <- c(proplist, proportion)
+}
+
+# Tabulate the data
+murder_by_boro <- cbind("Total Calls"=totallist,
+                        "Murder Calls"=murderlist,
+                        "Murder Call Percentage"=proplist)
+murder_by_boro <- as.table(murder_by_boro)
+rownames(murder_by_boro) <- borolist
+murder_by_boro
+```
+
+We can see here that despite the difference in actual number of incidents, all five boroughs of New York are consistent in their murder rates, between 17.5% and 20.5%.
+
+### Analysis 2 - Calls by Time of Day
+
+I would like to see if there is a pattern to when incidents tend to be reported, whether they are clustered in the morning, evening, etc. To do this, I group the number of incidents (uniquely identified by incident key) by hour of the day.
+
+```{r group_by_hour}
+# Create new column identifying the hour the call came in
+nypd_data <- mutate(nypd_data,
+                    OCCUR_HOUR = as.numeric(format(nypd_data[,"DATE_TIME"],"%H")))
+# Make array of calls grouped by hour
+grouphour <- nypd_data %>% count(OCCUR_HOUR)
+grouphour
+```
+
+Below is the volume of incidents, over the entire collection timeframe, plotted by hour of the day:
+
+```{r plot_by_hour}
+plot(grouphour[,"OCCUR_HOUR"],grouphour[,"n"],type="l",main="Shooting Incidents per Hour",
+     xlab="Hour of the Day (24-hour clock)",ylab="Number of Incidents (all-time)",
+     ylim=c(0,max(grouphour[,"n"])))
+```
+
+There is quite a trend here! It appears that mid-morning has the fewest calls related to shootings. After 9 am, incidents increase steadily, peaking at about midnight.
+
+### Modeling - Afternoon Calls
+
+I would like to see if I can model the rate incidents increase throughout the day towards midnight.
+
+```{r afternoon_calls}
+# Subset our hourly data to 9 am (minimum calls) through midnight
+grouphouraft <- grouphour[10:24,]
+# Create linear model
+modhourly <- lm(n ~ OCCUR_HOUR,grouphouraft)
+summary(modhourly)
+```
+
+From Pearson's correlation coefficient, it looks like a linear model is a good fit for our afternoon call data. Let's take a look at it visually.
+
+``` {r visualize_call_model}
+# Visualize against original data
+grouphouraft <- grouphouraft %>% mutate(pred = predict(modhourly))
+matplot(grouphouraft[,"OCCUR_HOUR"],grouphouraft[,c("n","pred")],type="l",
+        xlab="Hour of the Day (24-hour clock)",ylab="Number of Incidents (all-time)",
+        main="Linear Fit for Hourly Incidents")
+```
+
+We have a slight overestimate for incidents coming in in the afternoon, with a slight underestimate for morning and night, but overall this does seem a good fit.
+
+## Conclusion
+
+From this analysis of the shooting-related calls made to the NYPD from 2006-2020, we can conclude:
+
+* The number of shooting incidents has been decreasing over the 2010s.
+  + Brooklyn has had a larger decrease than the other four boroughs.
+  + However there has been a sharp increase in 2020 to 2000s levels.
+* Incidents are most common around midnight, increasing linearly throughout the afternoon and evening.
+
+I recommend based on this that future researchers look into possible causes of the increase in incidents in 2020, such as the COVID-19 pandemic and lockdown, local legislation, etc. It would be useful to do similar analysis on other cities to determine if this is a widespread increase or local to NYC.
+
+I also recommend the NYPD be aware of the increase in calls throughout the afternoon so they can properly prepare their dispatchers.
+
+### Caveats and Bias
+
+It is important to remember that this data is *not* the number of shooting incidents in New York City. It is the number of shooting incidents the NYPD were aware of and documented. There may be missing data of incidents not called in to the police.
+
+My personal background is in the United States, though not in the New York City area. I have also had training in gun violence prevention. I do not believe these have affected the quality of my analysis on broad trends in incident timing, but researchers of different backgrounds may be able to find different patterns in the data.
+
+```{r session_info}
+sessionInfo()
+```
